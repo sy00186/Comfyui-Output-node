@@ -23,7 +23,16 @@ def load_vates_core_via_windows_dll() -> bool:
         if str(RELEASE) not in sys.path:
             sys.path.insert(0, str(RELEASE))
         mod_ref = importlib.import_module("vates_core")
-        ok = hasattr(mod_ref, "encode_tensor") and hasattr(mod_ref, "decode_tensor")
+        ok = (
+            hasattr(mod_ref, "encode_tensor")
+            and hasattr(mod_ref, "encode_batch")
+            and hasattr(mod_ref, "encode_batch_async")
+            and hasattr(mod_ref, "get_pending_tasks")
+            and hasattr(mod_ref, "await_pending_writes")
+            and hasattr(mod_ref, "decode_tensor")
+            and hasattr(mod_ref, "decode_tensor_with_workflow")
+            and hasattr(mod_ref, "read_embedded_workflow_json")
+        )
     except Exception:
         ok = False
     finally:
@@ -43,7 +52,7 @@ def load_vates_core_via_sys_path_only() -> bool:
         if str(RELEASE) not in sys.path:
             sys.path.insert(0, str(RELEASE))
         mod = importlib.import_module("vates_core")
-        return hasattr(mod, "encode_tensor")
+        return hasattr(mod, "encode_tensor") and hasattr(mod, "encode_batch")
     except Exception:
         return False
 

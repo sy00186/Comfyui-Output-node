@@ -1,9 +1,10 @@
 [package]
 name = "vates_core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Vates Compressed Tensor — quantization + zstd (.dct)"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 
 [lib]
 name = "vates_core"
@@ -14,12 +15,17 @@ crate-type = ["cdylib", "rlib"]
 name = "vates"
 path = "src/main.rs"
 
+[features]
+default = ["python"]
+python = ["dep:pyo3", "dep:numpy"]
+
 [dependencies]
 ndarray = "0.16"
 rayon = "1.10"
-zstd = "0.13"
-pyo3 = { version = "0.22", features = ["extension-module"] }
-numpy = "0.22"
+zstd = { version = "0.13", features = ["zstdmt"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+pyo3 = { version = "0.22", optional = true, features = ["extension-module"] }
+numpy = { version = "0.22", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

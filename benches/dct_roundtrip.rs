@@ -15,19 +15,22 @@ fn bench_roundtrip(c: &mut Criterion) {
         b.iter(|| {
             Encoder::encode_file(
                 data.view(),
-                bb(w),
+                1,
+                bb(ch as u32),
                 bb(h),
-                bb(ch),
+                bb(w),
                 0,
+                24.0,
                 std::env::temp_dir().join("__dct_bench_encode.dct"),
                 3,
+                None,
             )
             .unwrap();
         });
     });
 
     let tmp = std::env::temp_dir().join("__dct_bench_roundtrip.dct");
-    Encoder::encode_file(data.view(), w, h, ch, 0, &tmp, 3).unwrap();
+    Encoder::encode_file(data.view(), 1, ch as u32, h, w, 0, 24.0, &tmp, 3, None).unwrap();
 
     group.bench_function("decode", |b| {
         b.iter(|| {

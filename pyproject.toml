@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "vates_core"
-version = "0.1.0"
+version = "0.1.1"
 description = "Vates：Rust 量化 + Zstd 的 ComfyUI / NumPy 扩展（.dct）"
 requires-python = ">=3.9"
 license = { text = "MIT OR Apache-2.0" }
@@ -18,3 +18,4 @@ dev = ["pytest>=7"]
 
 [tool.maturin]
 module-name = "vates_core"
+features = ["python"]
