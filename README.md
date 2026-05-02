@@ -115,28 +115,52 @@ For container type **`2`**, each compressed frame is stored as **compressed byte
 
 <h3 id="en-7-build--deployment">7. Build and deployment</h3>
 
-**Toolchain expectations.** Install **Rust 1.70 or newer**, **Python 3.9 or newer**, and **Cargo**. For the Python module, **maturin** is the supported workflow. ComfyUI itself still needs **PyTorch**, **NumPy**, and ComfyUI’s **`folder_paths`** when you run the bundled nodes.
+**Toolchain expectations.** Install **Rust 1.70 or newer**, **Python 3.9 or newer**, and **Cargo**. ComfyUI needs **PyTorch**, **NumPy**, and **`folder_paths`** when you run the bundled nodes.
 
-**Command-line binary only (disables the PyO3 extension feature):**
+**ComfyUI / one-shot native module (recommended).** From the **`dct-core`** root (same folder as **`Cargo.toml`**, **`install.py`**, **`vates_nodes.py`**):
+
+```bash
+cd dct-core
+python install.py
+```
+
+This runs **`cargo build --release --no-default-features --features python`**, then **aligns** artifacts next to **`vates_nodes.py`**: **Linux** copies **`target/release/libvates_core.so`** → **`./vates_core.so`** and applies **`chmod +x`**; **macOS** prefers **`target/release/libvates_core.dylib`** → **`./vates_core.so`** (falls back to **`.so`** names if present); **Windows** picks **`vates_core.cp*.pyd`** or **`vates_core.dll`** → **`./vates_core.pyd`**. It verifies **`import vates_core`** and may use a local wheel in **`wheels/`** or **`maturin develop`** as fallback. **Important:** **`cargo build --release --no-default-features`** **without** **`--features python`** does **not** build PyO3 and cannot satisfy **`import vates_core`**.
+
+Restart ComfyUI after success. If the extension is missing, plugin **`__init__.py`** prints a short console hint to run **`python install.py`** in this repo.
+
+**Sanity check:**
+
+```bash
+python check_vates.py
+```
+
+Expect **`Vates Core Bridge: SUCCESS`**.
+
+**`Cargo.toml` `[lib]`:** **`cdylib`** is required for the Python extension. This repo also lists **`rlib`** so the in-tree **`vates`** binary and **`[[bench]]`** can **`use vates_core::...`**; **`cdylib` only** would break those targets.
+
+**Command-line binary only (no Python module):**
 
 ```bash
 cd dct-core
 cargo build --release --no-default-features
 ```
 
-**Python extension (native module `vates_core`):**
+**Python extension without `install.py` (alternative):**
 
 ```bash
 maturin develop --release
 ```
 
-**Linux shared-object naming.** Some distributions emit **`libvates_core.so`**, while your Python loader may expect **`vates_core.so`**. Copy or symlink as needed:
+**Manual copy on Linux / macOS** (if you built with **`--features python`** yourself): **`libvates_core.so`** or **`libvates_core.dylib`** → **`vates_core.so`** in the repo root.
 
 ```bash
+# Linux
 cp target/release/libvates_core.so ./vates_core.so
+# macOS (rustc cdylib)
+cp target/release/libvates_core.dylib ./vates_core.so
 ```
 
-Add either **`custom_nodes/ComfyUI-Vates`** or the whole **`dct-core`** checkout under ComfyUI’s **custom_nodes** directory, then install **`vates_core`** with **`install.py`** or by placing a compatible wheel in **`wheels/`** and running **`pip install`**.
+Add **`custom_nodes/ComfyUI-Vates`** or the whole **`dct-core`** tree under ComfyUI **custom_nodes**.
 
 ---
 
@@ -312,28 +336,52 @@ dct-core/
 
 <h3 id="zh-7-部署与编译">7. 部署与编译</h3>
 
-**环境：** Rust **1.70+**，Python **3.9+**，`cargo`；扩展推荐 **maturin**；ComfyUI 需 **torch**、**numpy**、**folder_paths**。
+**环境：** Rust **1.70+**，Python **3.9+**，`cargo`；ComfyUI 需 **torch**、**numpy**、**folder_paths**。
 
-**仅 CLI / 纯 Rust（无 Python 模块）：**
+**ComfyUI / 一键原生扩展（推荐）：** 在 **`dct-core`** 根目录（与 **`Cargo.toml`、`install.py`、`vates_nodes.py`** 同级）执行一次：
+
+```bash
+cd dct-core
+python install.py
+```
+
+脚本会执行 **`cargo build --release --no-default-features --features python`**，再将产物**对齐**到仓库根：**Linux** 将 **`target/release/libvates_core.so`** 复制为 **`./vates_core.so`** 并 **`chmod +x`**；**macOS** 优先 **`target/release/libvates_core.dylib`** → **`./vates_core.so`**（若无则回退 **`.so`** 命名）；**Windows** 优先 **`vates_core.cp*.pyd`**，否则 **`vates_core.dll`**，统一对齐为 **`./vates_core.pyd`**。随后校验 **`import vates_core`**；亦可自动尝试 **`wheels/`** 本地 wheel 或 **`maturin develop`**。**注意：仅 **`cargo build --release --no-default-features`**、不加 **`--features python`** 时**不会**编译 PyO3，无法 **`import vates_core`**。
+
+成功后**重启 ComfyUI**。若缺少内核，插件 **`__init__.py`** 会在控制台提示在本仓库执行 **`python install.py`**。
+
+**自检：**
+
+```bash
+python check_vates.py
+```
+
+正常应输出 **`Vates Core Bridge: SUCCESS`**。
+
+**`Cargo.toml` `[lib]`：** 必须包含 **`cdylib`**（Python 扩展）。本仓库同时保留 **`rlib`**，供同仓 **`vates`** 与 **`[[bench]]`** 以 Rust 方式链接本库；若 **`crate-type`** 仅有 **`cdylib`**，这些目标会无法编译。
+
+**仅 CLI（无 Python 模块）：**
 
 ```bash
 cd dct-core
 cargo build --release --no-default-features
 ```
 
-**Python 扩展：**
+**不用 `install.py` 的替代方案：**
 
 ```bash
 maturin develop --release
 ```
 
-**Linux：** 若产物为 `libvates_core.so` 而运行时需要 `vates_core.so`：
+**Linux / macOS 手动对齐：** 若自行用 **`--features python`** 编译：
 
 ```bash
+# Linux
 cp target/release/libvates_core.so ./vates_core.so
+# macOS（cargo cdylib 常见为 .dylib）
+cp target/release/libvates_core.dylib ./vates_core.so
 ```
 
-将 **`custom_nodes/ComfyUI-Vates`** 或整包 **`dct-core`** 链入 ComfyUI；可用 **`install.py`** 或 **`wheels/`**。
+将 **`custom_nodes/ComfyUI-Vates`** 或整包 **`dct-core`** 放入 ComfyUI **`custom_nodes`**。
 
 ---
 

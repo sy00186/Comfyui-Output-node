@@ -6,10 +6,26 @@ ComfyUI-Vates：包入口（将本仓库置于 ComfyUI `custom_nodes/` 时使用
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
-from .vates_nodes import VatesLoadNode, VatesSaveNode
+from .vates_nodes import VatesLoadNode, VatesSaveNode, _ensure_vates_loaded
 from .vates_server_hooks import register_vates_server_routes
+
+try:
+    _ensure_vates_loaded()
+except RuntimeError as exc:
+    print(
+        "\n[Vates] ————————————————————————————————————————\n"
+        "[Vates] 无法加载原生扩展 vates_core。\n"
+        "[Vates] 在 **本仓库根目录**（含 Cargo.toml、install.py、vates_nodes.py）打开终端执行：\n"
+        "[Vates]   python install.py\n"
+        "[Vates] 然后 **重启 ComfyUI**。\n"
+        "[Vates] ————————————————————————————————————————\n",
+        file=sys.stderr,
+    )
+    raise exc
+
 
 _PKG = Path(__file__).resolve().parent
 _WEB = _PKG / "web"

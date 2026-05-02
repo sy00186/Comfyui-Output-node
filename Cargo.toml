@@ -9,6 +9,7 @@ readme = "README.md"
 [lib]
 name = "vates_core"
 path = "src/lib.rs"
+# `cdylib`：Python/PyO3 扩展（工单要求已满足）。须同时保留 `rlib`：若仅 `["cdylib"]`，`[[bin]] vates` 与 [[bench]] 无法链接本库（`use vates_core` 会失败）。
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]

@@ -9,14 +9,18 @@ Vates：ComfyUI 节点（保存 / 加载 .dct）。
 from __future__ import annotations
 
 import atexit
+import glob
 import json
 import logging
 import os
 import secrets
+import shutil
+import stat
 import sys
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 import folder_paths
 import numpy as np
@@ -39,21 +43,206 @@ SAVE_MODE_TO_ID = {
 }
 
 
+def _vates_repo_root() -> Path:
+    """含 `vates_nodes.py` 与对齐后的 `vates_core` 二进制的目录。"""
+    return Path(__file__).resolve().parent
+
+
+def _pick_windows_native_artifact(release_dir: Path) -> Path | None:
+    if not release_dir.is_dir():
+        return None
+    tagged = list(release_dir.glob("vates_core.cp*.pyd"))
+    if tagged:
+        return max(tagged, key=lambda p: p.stat().st_mtime)
+    dll = release_dir / "vates_core.dll"
+    if dll.is_file():
+        return dll
+    plain = release_dir / "vates_core.pyd"
+    if plain.is_file():
+        return plain
+    return None
+
+
+def _try_align_native_from_target_release(root: Path) -> list[str]:
+    """若 `target/release` 存在典型产物，则复制到根目录以便 `import vates_core`。返回已写入路径。"""
+    release = root / "target" / "release"
+    touched: list[str] = []
+    if not release.is_dir():
+        return touched
+
+    if sys.platform == "win32":
+        src = _pick_windows_native_artifact(release)
+        if src is not None:
+            dst = root / "vates_core.pyd"
+            shutil.copy2(src, dst)
+            touched.append(str(dst))
+    elif sys.platform == "darwin":
+        dylib = release / "libvates_core.dylib"
+        if dylib.is_file():
+            dst = root / "vates_core.so"
+            shutil.copy2(dylib, dst)
+            try:
+                os.chmod(
+                    dst,
+                    stat.S_IRUSR
+                    | stat.S_IWUSR
+                    | stat.S_IXUSR
+                    | stat.S_IRGRP
+                    | stat.S_IXGRP
+                    | stat.S_IROTH
+                    | stat.S_IXOTH,
+                )
+            except OSError:
+                pass
+            touched.append(str(dst))
+        else:
+            lib = release / "libvates_core.so"
+            alt = release / "vates_core.so"
+            if lib.is_file():
+                dst = root / "vates_core.so"
+                shutil.copy2(lib, dst)
+                try:
+                    os.chmod(
+                        dst,
+                        stat.S_IRUSR
+                        | stat.S_IWUSR
+                        | stat.S_IXUSR
+                        | stat.S_IRGRP
+                        | stat.S_IXGRP
+                        | stat.S_IROTH
+                        | stat.S_IXOTH,
+                    )
+                except OSError:
+                    pass
+                touched.append(str(dst))
+            elif alt.is_file():
+                dst = root / "vates_core.so"
+                shutil.copy2(alt, dst)
+                try:
+                    os.chmod(
+                        dst,
+                        stat.S_IRUSR
+                        | stat.S_IWUSR
+                        | stat.S_IXUSR
+                        | stat.S_IRGRP
+                        | stat.S_IXGRP
+                        | stat.S_IROTH
+                        | stat.S_IXOTH,
+                    )
+                except OSError:
+                    pass
+                touched.append(str(dst))
+    else:
+        lib = release / "libvates_core.so"
+        alt = release / "vates_core.so"
+        if lib.is_file():
+            dst = root / "vates_core.so"
+            shutil.copy2(lib, dst)
+            try:
+                os.chmod(
+                    dst,
+                    stat.S_IRUSR
+                    | stat.S_IWUSR
+                    | stat.S_IXUSR
+                    | stat.S_IRGRP
+                    | stat.S_IXGRP
+                    | stat.S_IROTH
+                    | stat.S_IXOTH,
+                )
+            except OSError:
+                pass
+            touched.append(str(dst))
+        elif alt.is_file():
+            dst = root / "vates_core.so"
+            shutil.copy2(alt, dst)
+            try:
+                os.chmod(
+                    dst,
+                    stat.S_IRUSR
+                    | stat.S_IWUSR
+                    | stat.S_IXUSR
+                    | stat.S_IRGRP
+                    | stat.S_IXGRP
+                    | stat.S_IROTH
+                    | stat.S_IXOTH,
+                )
+            except OSError:
+                pass
+            touched.append(str(dst))
+    return touched
+
+
+def _format_vates_import_error(
+    cause: BaseException,
+    *,
+    root: Path,
+    tried_paths: list[str],
+) -> str:
+    cwd = os.getcwd()
+    release = root / "target" / "release"
+    lines = [
+        "未能导入 vates_core（原生扩展未就位或未对齐）。",
+        f"  当前工作目录 (cwd): {cwd}",
+        f"  插件/代码根目录 (Vates root): {root}",
+        "",
+        "  已检查或可供对齐的路径（含 target/release 典型产物）:",
+    ]
+    for p in tried_paths:
+        exists = "存在" if Path(p).is_file() else "不存在"
+        lines.append(f"    [{exists}] {p}")
+    if not tried_paths:
+        lines.append("    （无）")
+    lines.extend(
+        [
+            "",
+            "  解决办法：在 Vates 仓库根目录（含 Cargo.toml 与 install.py）执行一次：",
+            "    python install.py",
+            "  然后重启 ComfyUI。",
+            f"  详情: {cause}",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _ensure_vates_loaded() -> None:
-    """确认原生扩展 vates_core 已载入（惰性导入，并将插件目录置于 sys.path 首位）。"""
+    """确认原生扩展 vates_core 已载入（惰性导入；必要时从 target/release 对齐到仓库根目录）。"""
     global vates_core
     if vates_core is not None:
         return
-    current_dir = os.path.dirname(os.path.abspath(__file__))
+    root = _vates_repo_root()
+    current_dir = str(root)
     if current_dir not in sys.path:
         sys.path.insert(0, current_dir)
-    try:
+
+    release = root / "target" / "release"
+    tried_paths: list[str] = [
+        str(root / "vates_core.so"),
+        str(root / "vates_core.pyd"),
+        str(release / "libvates_core.dylib"),
+        str(release / "libvates_core.so"),
+        str(release / "vates_core.so"),
+        str(release / "vates_core.dll"),
+    ]
+    tried_paths.extend(sorted(glob.glob(str(release / "vates_core*.pyd"))))
+
+    def _do_import() -> object:
         import vates_core as vc
-        vates_core = vc
-    except ImportError as e:
-        raise RuntimeError(
-            f"Vates Core 导入失败。目录 {current_dir} 内容: {os.listdir(current_dir)}。详情: {e}"
-        ) from e
+
+        return vc
+
+    try:
+        vates_core = _do_import()
+    except (ImportError, OSError):
+        aligned = _try_align_native_from_target_release(root)
+        if aligned:
+            tried_paths.extend(aligned)
+        try:
+            vates_core = _do_import()
+        except (ImportError, OSError) as e2:
+            raise RuntimeError(_format_vates_import_error(e2, root=root, tried_paths=tried_paths)) from e2
+    except Exception as e:
+        raise RuntimeError(_format_vates_import_error(e, root=root, tried_paths=tried_paths)) from e
+
     _register_atexit_flush_once()
 
 

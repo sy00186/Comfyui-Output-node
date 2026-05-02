@@ -1,5 +1,7 @@
 # Prebuilt wheels（可选）
 
+若无 wheel、但有 Rust 工具链：请在 **`dct-core` 仓库根目录**运行 **`python install.py`**（将执行 `cargo build … --features python` 并把 `.so` / `.pyd` 对齐到根目录；详见主 **`README.md`**）。
+
 将与本环境 **Python 版本、操作系统** 匹配的 `vates_core-*.whl` 放在此目录下，便于：
 
 - 离线或受限环境中由根目录 `install.py` 自动 `pip install`；

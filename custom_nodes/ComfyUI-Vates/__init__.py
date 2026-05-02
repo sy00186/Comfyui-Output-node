@@ -29,8 +29,27 @@ def _ensure_vates_nodes_importable() -> None:
 
 
 _ensure_vates_nodes_importable()
-from vates_nodes import VatesLoadNode, VatesSaveNode  # noqa: E402
+from vates_nodes import (  # noqa: E402
+    VatesLoadNode,
+    VatesSaveNode,
+    _ensure_vates_loaded,
+)
 from vates_server_hooks import register_vates_server_routes  # noqa: E402
+
+try:
+    _ensure_vates_loaded()
+except RuntimeError as exc:
+    print(
+        "\n[Vates] ————————————————————————————————————————\n"
+        "[Vates] 无法加载原生扩展 vates_core。\n"
+        "[Vates] 在 **dct-core 仓库根目录**（含 Cargo.toml、install.py、vates_nodes.py）执行：\n"
+        "[Vates]   python install.py\n"
+        "[Vates] 然后 **重启 ComfyUI**。\n"
+        "[Vates] ————————————————————————————————————————\n",
+        file=sys.stderr,
+    )
+    raise exc
+
 
 def _vates_web_dir() -> str:
     here = Path(__file__).resolve().parent
