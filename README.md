@@ -66,9 +66,9 @@ After the header and optional `META` block, a **single-frame** file holds one Zs
 
 ---
 
-<h3 id="en-2-performance">2. Performance: zero-copy path, parallel quantization, threaded Zstd</h3>
+<h3 id="en-2-performance">2. Performance: FFI-safe encode path, parallel quantization, threaded Zstd</h3>
 
-- **Zero-copy from Python.** The `encode_tensor` binding expects a **C-contiguous `float32`** NumPy array in **CHW** order. When the layout is valid, PyO3 hands Rust a read-only view and the encoder wraps it as an `ArrayView1` without copying the pixel buffer first. Call `numpy.ascontiguousarray(..., dtype=numpy.float32)` if the binding reports a layout error.
+- **Python → Rust (sync encode).** Bindings such as **`encode_tensor`**, **`encode_batch`**, and **`append_to_vats`** require a **C-contiguous `float32`** NumPy array (**CHW** or **BHWC** as documented). After layout checks, the implementation **copies** the float buffer into a Rust-owned **`Vec<f32>`** while the GIL is held, then runs the encoder under **`py.allow_threads`** on that copy. This trades some memory bandwidth for **thread-safe** behavior when the GIL is released (no use-after-free from NumPy storage). Use `numpy.ascontiguousarray(..., dtype=numpy.float32)` if you see the layout error. **Async** writers (`encode_batch_async`, `append_to_vats_async`) also own a **`Vec<f32>`** before dispatching background work.
 
 - **Parallel quantization.** Global min/max and the linear map to **8-bit** codes use **Rayon**, so large frames benefit from multiple CPU cores.
 
@@ -126,7 +126,7 @@ python install.py
 
 This runs **`cargo build --release --no-default-features --features python`**, then **aligns** artifacts next to **`vates_nodes.py`**: **Linux** copies **`target/release/libvates_core.so`** → **`./vates_core.so`** and applies **`chmod +x`**; **macOS** prefers **`target/release/libvates_core.dylib`** → **`./vates_core.so`** (falls back to **`.so`** names if present); **Windows** picks **`vates_core.cp*.pyd`** or **`vates_core.dll`** → **`./vates_core.pyd`**. It verifies **`import vates_core`** and may use a local wheel in **`wheels/`** or **`maturin develop`** as fallback. **Important:** **`cargo build --release --no-default-features`** **without** **`--features python`** does **not** build PyO3 and cannot satisfy **`import vates_core`**.
 
-Restart ComfyUI after success. If the extension is missing, plugin **`__init__.py`** prints a short console hint to run **`python install.py`** in this repo.
+Restart ComfyUI after success. If the extension is missing, plugin **`__init__.py`** prints a short console hint to run **`python install.py`** in this repo. When you use the **ComfyUI** tree’s **`custom_nodes/ComfyUI-Vates`** sibling to **`dct-core`**, that entry may **delegate** to **`dct-core/custom_nodes/ComfyUI-Vates/__init__.py`** so plugin logic stays single-sourced; **`vates_import_shim.py`** registers the synthetic package (callers must **`sys.path.insert`** the repo root **before** **`register_vates_package`**—the shim does not insert paths itself).
 
 **Sanity check:**
 
@@ -234,6 +234,8 @@ dct-core/
   src/python_binding.rs
   src/main.rs               # vates CLI
   vates_nodes.py            # ComfyUI node definitions
+  vates_repo_meta.py        # expected core version (shared with nodes)
+  vates_import_shim.py      # synthetic __comfyui_vates__ package for relative imports
   vates_server_hooks.py     # POST /vates/extract_workflow
   web/vates_dct_drop.js     # browser drag-and-drop helper
   custom_nodes/ComfyUI-Vates/
@@ -258,7 +260,7 @@ dct-core/
 ### 目录
 
 1. [二进制协议：32 字节头](#zh-1-二进制协议32-字节头)
-2. [性能：零拷贝与并行](#zh-2-性能)
+2. [性能：FFI 安全拷贝与并行](#zh-2-性能)
 3. [视频字典压缩](#zh-3-视频字典压缩)
 4. [可靠性与 XXH3](#zh-4-可靠性与-xxh3)
 5. [工作流嵌入与拖拽还原](#zh-5-工作流嵌入与拖拽还原)
@@ -293,9 +295,9 @@ dct-core/
 
 ---
 
-<h3 id="zh-2-性能">2. 性能：零拷贝、并行量化、多线程 Zstd</h3>
+<h3 id="zh-2-性能">2. 性能：FFI 安全拷贝、并行量化、多线程 Zstd</h3>
 
-- **零拷贝（Python → Rust）：** `encode_tensor` 要求 **C 连续 `float32` CHW** NumPy；PyO3 合法布局下直接借用缓冲区，`ArrayView1` 编码。否则请先 `numpy.ascontiguousarray(..., dtype=float32)`。
+- **Python → Rust（同步编码）：** **`encode_tensor`**、**`encode_batch`**、**`append_to_vats`** 等要求 **C 连续 `float32`**（CHW / BHWC 见节点说明）。校验布局后，在**持有 GIL**时把浮点缓冲**拷贝**到 Rust 自有的 **`Vec<f32>`**，再在 **`py.allow_threads`** 下对该副本编码，避免释放 GIL 后仍借用 NumPy 堆内存导致的未定义行为；**异步**写入（**`encode_batch_async`**、**`append_to_vats_async`**）同样在派生前持有 **`Vec<f32>`**。仍请先 `numpy.ascontiguousarray(..., dtype=float32)` 以满足布局要求。
 - **并行量化：** min/max 与 8-bit 量化使用 **Rayon**（并行规约与逐元素写回）。
 - **多线程 Zstd：** 依赖启用 **`zstdmt`**；`zstd_encode_mt` 按 `available_parallelism()` 设置 worker（**上限 8**）。
 
@@ -347,7 +349,7 @@ python install.py
 
 脚本会执行 **`cargo build --release --no-default-features --features python`**，再将产物**对齐**到仓库根：**Linux** 将 **`target/release/libvates_core.so`** 复制为 **`./vates_core.so`** 并 **`chmod +x`**；**macOS** 优先 **`target/release/libvates_core.dylib`** → **`./vates_core.so`**（若无则回退 **`.so`** 命名）；**Windows** 优先 **`vates_core.cp*.pyd`**，否则 **`vates_core.dll`**，统一对齐为 **`./vates_core.pyd`**。随后校验 **`import vates_core`**；亦可自动尝试 **`wheels/`** 本地 wheel 或 **`maturin develop`**。**注意：仅 **`cargo build --release --no-default-features`**、不加 **`--features python`** 时**不会**编译 PyO3，无法 **`import vates_core`**。
 
-成功后**重启 ComfyUI**。若缺少内核，插件 **`__init__.py`** 会在控制台提示在本仓库执行 **`python install.py`**。
+成功后**重启 ComfyUI**。若缺少内核，插件 **`__init__.py`** 会在控制台提示在本仓库执行 **`python install.py`**。若 ComfyUI 侧 **`custom_nodes/ComfyUI-Vates`** 与 **`dct-core`** 为同级目录，入口可能**委托**加载 **`dct-core/custom_nodes/ComfyUI-Vates/__init__.py`** 以保持单源；**`register_vates_package`** 的调用方须先把仓库根目录 **`sys.path.insert`**（**`vates_import_shim`** 自身不再插入路径）。
 
 **自检：**
 
@@ -440,7 +442,8 @@ let decoded = Decoder::decode_file_full("file.dct")?;
 ```
 dct-core/
   src/core.rs, src/python_binding.rs, src/main.rs
-  vates_nodes.py, vates_server_hooks.py, web/vates_dct_drop.js
+  vates_nodes.py, vates_repo_meta.py, vates_import_shim.py
+  vates_server_hooks.py, web/vates_dct_drop.js
   custom_nodes/ComfyUI-Vates/, install.py, check_vates.py
 ```
 

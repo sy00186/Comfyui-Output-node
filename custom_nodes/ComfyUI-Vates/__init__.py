@@ -18,9 +18,13 @@ def _ensure_vates_nodes_importable() -> None:
     )
     for root in roots:
         if (root / "vates_nodes.py").is_file():
+            root = root.resolve()
             key = str(root)
             if key not in sys.path:
                 sys.path.insert(0, key)
+            from vates_import_shim import register_vates_package
+
+            register_vates_package(root)
             return
     raise RuntimeError(
         "ComfyUI-Vates：未找到 vates_nodes.py。请将本目录置于 "

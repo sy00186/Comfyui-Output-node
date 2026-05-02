@@ -139,6 +139,9 @@ def probe_nodes_module() -> bool:
     try:
         if str(ROOT) not in sys.path:
             sys.path.insert(0, str(ROOT))
+        from vates_import_shim import register_vates_package
+
+        register_vates_package(ROOT)
         import vates_nodes  # noqa: F401
     except ModuleNotFoundError as e:
         return e.name == "folder_paths"

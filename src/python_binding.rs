@@ -3,7 +3,7 @@
 use crate::{Decoder, DctError, Encoder};
 use ndarray::ArrayView1;
 use numpy::{PyArray, PyReadonlyArray3, PyReadonlyArray4};
-use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyModule, PyModuleMethods};
 use std::path::PathBuf;
@@ -61,6 +61,28 @@ fn try_python_log_error(line: &str) {
     });
 }
 
+fn panic_payload_to_pyerr(ctx: &'static str, payload: Box<dyn std::any::Any + Send>) -> PyErr {
+    let msg: String = match payload.downcast::<String>() {
+        Ok(s) => *s,
+        Err(p) => match p.downcast::<&'static str>() {
+            Ok(s) => (*s).to_string(),
+            Err(_) => "(opaque panic payload)".to_string(),
+        },
+    };
+    let full = format!("[vates_core] {ctx}: Rust panic — {msg}");
+    eprintln!("{full}");
+    try_python_log_error(&full);
+    PyRuntimeError::new_err(full)
+}
+
+/// 将同步 `#[pyfunction]` 体内未捕获的 `panic!` 转为 `PyRuntimeError`，避免拖垮解释器进程。
+fn pyfun_catch_panic<T>(ctx: &'static str, f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(inner) => inner,
+        Err(payload) => Err(panic_payload_to_pyerr(ctx, payload)),
+    }
+}
+
 fn spawn_save_task(
     name: &'static str,
     path_display: String,
@@ -100,10 +122,9 @@ fn encode_tensor<'py>(
     let arr = tensor.as_array();
     if !arr.is_standard_layout() {
         return Err(PyValueError::new_err(
-            "tensor 须为 C 连续且标准布局，方可零拷贝；请先 numpy.ascontiguousarray(..., dtype=float32)。",
+            "必须传入 C 连续的 float32 格式数据；请先 numpy.ascontiguousarray(..., dtype=float32)。",
         ));
     }
-    debug_assert!(arr.is_standard_layout());
 
     let slice = arr
         .as_slice()
@@ -145,27 +166,29 @@ fn encode_tensor<'py>(
         )));
     }
 
-    let path = std::path::PathBuf::from(output_path);
+    let data_owned: Vec<f32> = slice.to_vec();
     const ZSTD_LEVEL: i32 = 3;
     let time_it = encode_timing_enabled();
     let t0 = time_it.then(std::time::Instant::now);
 
-    py.allow_threads(|| {
-        let view = ArrayView1::from(slice);
-        Encoder::encode_file(
-            view,
-            batch,
-            channels_u32,
-            height,
-            width,
-            mode,
-            fps,
-            &path,
-            ZSTD_LEVEL,
-            metadata.as_deref(),
-        )
-    })
-    .map_err(dct_error_to_py)?;
+    pyfun_catch_panic("encode_tensor", move || {
+        py.allow_threads(move || {
+            let view = ArrayView1::from(&data_owned);
+            Encoder::encode_file(
+                view,
+                batch,
+                channels_u32,
+                height,
+                width,
+                mode,
+                fps,
+                output_path,
+                ZSTD_LEVEL,
+                metadata.as_deref(),
+            )
+        })
+        .map_err(dct_error_to_py)
+    })?;
 
     if let Some(t0) = t0 {
         eprintln!(
@@ -205,27 +228,29 @@ fn encode_batch<'py>(
     let width = u32_fit(w_dim, "width (W)")?;
     let channels = u32_fit(c_dim, "channels (C)")?;
 
-    let path = std::path::PathBuf::from(output_path);
+    let data_owned: Vec<f32> = slice.to_vec();
     const ZSTD_LEVEL: i32 = 3;
     let time_it = encode_timing_enabled();
     let t0 = time_it.then(std::time::Instant::now);
 
-    py.allow_threads(|| {
-        Encoder::encode_batch_bhwc_file(
-            slice,
-            batch,
-            height,
-            width,
-            channels,
-            fps,
-            &path,
-            ZSTD_LEVEL,
-            force_p2,
-            header_mode,
-            metadata.as_deref(),
-        )
-    })
-    .map_err(dct_error_to_py)?;
+    pyfun_catch_panic("encode_batch", move || {
+        py.allow_threads(move || {
+            Encoder::encode_batch_bhwc_file(
+                &data_owned,
+                batch,
+                height,
+                width,
+                channels,
+                fps,
+                output_path,
+                ZSTD_LEVEL,
+                force_p2,
+                header_mode,
+                metadata.as_deref(),
+            )
+        })
+        .map_err(dct_error_to_py)
+    })?;
 
     if let Some(t0) = t0 {
         eprintln!(
@@ -270,31 +295,31 @@ fn encode_batch_async<'py>(
     let path = PathBuf::from(output_path);
     let path_display = output_path.to_string();
     const ZSTD_LEVEL: i32 = 3;
-    let meta = metadata.clone();
 
-    py.allow_threads(|| {
-        spawn_save_task(
-            "encode_batch_async",
-            path_display.clone(),
-            move || {
-                Encoder::encode_batch_bhwc_file(
-                    &data,
-                    batch,
-                    height,
-                    width,
-                    channels,
-                    fps,
-                    &path,
-                    ZSTD_LEVEL,
-                    force_p2,
-                    header_mode,
-                    meta.as_deref(),
-                )
-            },
-        );
-    });
-
-    Ok(())
+    pyfun_catch_panic("encode_batch_async", move || {
+        py.allow_threads(|| {
+            spawn_save_task(
+                "encode_batch_async",
+                path_display,
+                move || {
+                    Encoder::encode_batch_bhwc_file(
+                        &data,
+                        batch,
+                        height,
+                        width,
+                        channels,
+                        fps,
+                        &path,
+                        ZSTD_LEVEL,
+                        force_p2,
+                        header_mode,
+                        metadata.as_deref(),
+                    )
+                },
+            );
+        });
+        Ok(())
+    })
 }
 
 #[pyfunction]
@@ -321,22 +346,24 @@ fn append_to_vats<'py>(
     let width = u32_fit(w_dim, "width (W)")?;
     let channels = u32_fit(c_dim, "channels (C)")?;
 
-    let path = std::path::PathBuf::from(output_path);
+    let data_owned: Vec<f32> = slice.to_vec();
     const ZSTD_LEVEL: i32 = 3;
 
-    py.allow_threads(|| {
-        Encoder::append_p2_bhwc_frames(
-            &path,
-            slice,
-            b_new,
-            height,
-            width,
-            channels,
-            fps,
-            ZSTD_LEVEL,
-        )
-    })
-    .map_err(dct_error_to_py)?;
+    pyfun_catch_panic("append_to_vats", move || {
+        py.allow_threads(move || {
+            Encoder::append_p2_bhwc_frames(
+                output_path,
+                &data_owned,
+                b_new,
+                height,
+                width,
+                channels,
+                fps,
+                ZSTD_LEVEL,
+            )
+        })
+        .map_err(dct_error_to_py)
+    })?;
 
     Ok(())
 }
@@ -370,40 +397,45 @@ fn append_to_vats_async<'py>(
     let path_display = output_path.to_string();
     const ZSTD_LEVEL: i32 = 3;
 
-    py.allow_threads(|| {
-        spawn_save_task(
-            "append_to_vats_async",
-            path_display.clone(),
-            move || {
-                Encoder::append_p2_bhwc_frames(
-                    &path,
-                    &data,
-                    b_new,
-                    height,
-                    width,
-                    channels,
-                    fps,
-                    ZSTD_LEVEL,
-                )
-            },
-        );
-    });
-
-    Ok(())
+    pyfun_catch_panic("append_to_vats_async", move || {
+        py.allow_threads(|| {
+            spawn_save_task(
+                "append_to_vats_async",
+                path_display,
+                move || {
+                    Encoder::append_p2_bhwc_frames(
+                        &path,
+                        &data,
+                        b_new,
+                        height,
+                        width,
+                        channels,
+                        fps,
+                        ZSTD_LEVEL,
+                    )
+                },
+            );
+        });
+        Ok(())
+    })
 }
 
 #[pyfunction]
-fn peek_dct_header(path: &str) -> PyResult<(u32, u32, u32, u32, u8, u8, f32)> {
-    let h = Decoder::read_header_only(path).map_err(dct_error_to_py)?;
-    Ok((
-        h.batch,
-        h.channels,
-        h.height,
-        h.width,
-        h.mode,
-        h.reserved,
-        h.fps,
-    ))
+fn peek_dct_header(py: Python<'_>, path: &str) -> PyResult<(u32, u32, u32, u32, u8, u8, f32)> {
+    pyfun_catch_panic("peek_dct_header", || {
+        py.allow_threads(|| {
+            let h = Decoder::read_header_only(path).map_err(dct_error_to_py)?;
+            Ok((
+                h.batch,
+                h.channels,
+                h.height,
+                h.width,
+                h.mode,
+                h.reserved,
+                h.fps,
+            ))
+        })
+    })
 }
 
 #[pyfunction]
@@ -413,13 +445,15 @@ fn get_pending_tasks() -> usize {
 
 #[pyfunction]
 fn await_pending_writes(py: Python<'_>) -> PyResult<()> {
-    py.allow_threads(|| loop {
-        if PENDING_TASKS.load(Ordering::SeqCst) == 0 {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(4));
-    });
-    Ok(())
+    pyfun_catch_panic("await_pending_writes", || {
+        py.allow_threads(|| loop {
+            if PENDING_TASKS.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        });
+        Ok(())
+    })
 }
 
 #[pyfunction]
@@ -428,35 +462,35 @@ fn decode_tensor<'py>(
     py: Python<'py>,
     input_path: &str,
 ) -> PyResult<Py<PyArray<f32, ndarray::Dim<ndarray::IxDynImpl>>>> {
-    let path = input_path.to_string();
+    pyfun_catch_panic("decode_tensor", || {
+        let decoded = py
+            .allow_threads(|| Decoder::decode_file_full(input_path))
+            .map_err(dct_error_to_py)?;
 
-    let decoded = py
-        .allow_threads(move || Decoder::decode_file_full(path))
-        .map_err(dct_error_to_py)?;
+        let hdr = decoded.header;
+        let floats = decoded.floats;
 
-    let hdr = decoded.header;
-    let floats = decoded.floats;
+        let shape = if hdr.batch <= 1 {
+            ndarray::IxDyn(&[
+                hdr.channels as usize,
+                hdr.height as usize,
+                hdr.width as usize,
+            ])
+        } else {
+            ndarray::IxDyn(&[
+                hdr.batch as usize,
+                hdr.channels as usize,
+                hdr.height as usize,
+                hdr.width as usize,
+            ])
+        };
+        let arr = ndarray::Array::from_shape_vec(shape, floats).map_err(|e| {
+            PyValueError::new_err(format!("解码数据与文件头维度不一致：{}", e))
+        })?;
 
-    let shape = if hdr.batch <= 1 {
-        ndarray::IxDyn(&[
-            hdr.channels as usize,
-            hdr.height as usize,
-            hdr.width as usize,
-        ])
-    } else {
-        ndarray::IxDyn(&[
-            hdr.batch as usize,
-            hdr.channels as usize,
-            hdr.height as usize,
-            hdr.width as usize,
-        ])
-    };
-    let arr = ndarray::Array::from_shape_vec(shape, floats).map_err(|e| {
-        PyValueError::new_err(format!("解码数据与文件头维度不一致：{}", e))
-    })?;
-
-    let bound = PyArray::<f32, ndarray::IxDyn>::from_owned_array_bound(py, arr);
-    Ok(bound.unbind())
+        let bound = PyArray::<f32, ndarray::IxDyn>::from_owned_array_bound(py, arr);
+        Ok(bound.unbind())
+    })
 }
 
 #[pyfunction]
@@ -468,35 +502,38 @@ fn decode_tensor_with_workflow<'py>(
     Py<PyArray<f32, ndarray::Dim<ndarray::IxDynImpl>>>,
     Option<String>,
 )> {
-    let path = input_path.to_string();
-    let d = py
-        .allow_threads(move || Decoder::decode_file_full(path))
-        .map_err(dct_error_to_py)?;
-    let hdr = d.header;
-    let floats = d.floats;
-    let wf = d.workflow_json;
-    let shape = if hdr.batch <= 1 {
-        ndarray::IxDyn(&[
-            hdr.channels as usize,
-            hdr.height as usize,
-            hdr.width as usize,
-        ])
-    } else {
-        ndarray::IxDyn(&[
-            hdr.batch as usize,
-            hdr.channels as usize,
-            hdr.height as usize,
-            hdr.width as usize,
-        ])
-    };
-    let arr = ndarray::Array::from_shape_vec(shape, floats).map_err(|e| {
-        PyValueError::new_err(format!("解码数据与文件头维度不一致：{}", e))
-    })?;
-    let bound = PyArray::<f32, ndarray::IxDyn>::from_owned_array_bound(py, arr);
-    Ok((bound.unbind(), wf))
+    pyfun_catch_panic("decode_tensor_with_workflow", || {
+        let d = py
+            .allow_threads(|| Decoder::decode_file_full(input_path))
+            .map_err(dct_error_to_py)?;
+        let hdr = d.header;
+        let floats = d.floats;
+        let wf = d.workflow_json;
+        let shape = if hdr.batch <= 1 {
+            ndarray::IxDyn(&[
+                hdr.channels as usize,
+                hdr.height as usize,
+                hdr.width as usize,
+            ])
+        } else {
+            ndarray::IxDyn(&[
+                hdr.batch as usize,
+                hdr.channels as usize,
+                hdr.height as usize,
+                hdr.width as usize,
+            ])
+        };
+        let arr = ndarray::Array::from_shape_vec(shape, floats).map_err(|e| {
+            PyValueError::new_err(format!("解码数据与文件头维度不一致：{}", e))
+        })?;
+        let bound = PyArray::<f32, ndarray::IxDyn>::from_owned_array_bound(py, arr);
+        Ok((bound.unbind(), wf))
+    })
 }
 
 #[pyfunction]
-fn read_embedded_workflow_json(path: &str) -> PyResult<Option<String>> {
-    Decoder::read_embedded_workflow_json(path).map_err(dct_error_to_py)
+fn read_embedded_workflow_json(py: Python<'_>, path: &str) -> PyResult<Option<String>> {
+    pyfun_catch_panic("read_embedded_workflow_json", || {
+        py.allow_threads(|| Decoder::read_embedded_workflow_json(path).map_err(dct_error_to_py))
+    })
 }

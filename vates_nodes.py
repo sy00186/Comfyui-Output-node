@@ -26,7 +26,7 @@ import folder_paths
 import numpy as np
 import torch
 
-from vates_repo_meta import expected_vates_core_version
+from .vates_repo_meta import expected_vates_core_version
 
 vates_core = None  # type: ignore[assignment, misc]
 logger = logging.getLogger(__name__)
@@ -300,6 +300,49 @@ def _sanitize_segment(raw: str, *, fallback: str) -> str:
     return out if out else fallback
 
 
+def _resolved_path_under_output(raw: str, output_dir: str) -> str:
+    """将 ``dct_path`` 规范为绝对路径并校验落在 ``output_dir`` 沙箱内（防绝对路径与 ``..`` 逃逸）。"""
+    out = (output_dir or "").strip()
+    if not out:
+        raise ValueError("ComfyUI output 目录无效")
+    out_abs = os.path.realpath(out)
+    s = (raw or "").strip()
+    if not s:
+        raise ValueError("dct_path 不能为空")
+    cand = os.path.realpath(s) if os.path.isabs(s) else os.path.realpath(os.path.join(out_abs, s))
+    try:
+        common = os.path.commonpath([cand, out_abs])
+    except ValueError as exc:
+        raise PermissionError(
+            f"[Vates] dct_path 拒绝访问：解析结果 {cand!r} 与授权 output 根 {out_abs!r} 无法建立共同路径前缀（例如跨盘符）。"
+        ) from exc
+    if os.path.normcase(common) != os.path.normcase(out_abs):
+        raise PermissionError(
+            f"[Vates] dct_path 已解析为 {cand!r}，不在 ComfyUI output 目录 {out_abs!r} 内。"
+        )
+    return cand
+
+
+def _require_path_under_comfy_output(filepath: str, output_dir: str) -> str:
+    """保存链路生成的路径亦经 ``realpath`` + ``commonpath`` 校验，防止异常配置下的逃逸。"""
+    out = (output_dir or "").strip()
+    if not out:
+        raise ValueError("ComfyUI output 目录无效")
+    out_abs = os.path.realpath(out)
+    cand = os.path.realpath(filepath)
+    try:
+        common = os.path.commonpath([cand, out_abs])
+    except ValueError as exc:
+        raise PermissionError(
+            f"[Vates] 写入路径 {cand!r} 已越权：与授权 output 根 {out_abs!r} 无法建立共同前缀。"
+        ) from exc
+    if os.path.normcase(common) != os.path.normcase(out_abs):
+        raise PermissionError(
+            f"[Vates] 写入路径 {cand!r} 不在 ComfyUI output 目录 {out_abs!r} 内。"
+        )
+    return cand
+
+
 def _tensor_bhwc_to_chw_numpy(images: torch.Tensor, index: int) -> np.ndarray:
     """自 BHWC 取一帧 → CHW float32；尽量单次 contiguous，减少中间变量。"""
     x = images[index].permute(2, 0, 1).detach()
@@ -350,17 +393,21 @@ def _encode_dct_frame(
     """调用原生编码：入参 C 连续 float32，供 Rust 只读借用（P1 零拷贝路径）。"""
     frame_np = np.ascontiguousarray(frame_np, dtype=np.float32)
     timing = os.environ.get("VATES_ENCODE_TIMING", "").lower() in ("1", "true", "yes")
-    if timing:
-        t0 = time.perf_counter_ns()
-        vates_core.encode_tensor(
-            frame_np, filepath, int(mode_id), float(fps), 1, metadata
-        )
-        dt = time.perf_counter_ns() - t0
-        print(f"[Vates P1] encode 墙钟 {dt} ns → {filepath}", flush=True)
-    else:
-        vates_core.encode_tensor(
-            frame_np, filepath, int(mode_id), float(fps), 1, metadata
-        )
+    try:
+        if timing:
+            t0 = time.perf_counter_ns()
+            vates_core.encode_tensor(
+                frame_np, filepath, int(mode_id), float(fps), 1, metadata
+            )
+            dt = time.perf_counter_ns() - t0
+            print(f"[Vates P1] encode 墙钟 {dt} ns → {filepath}", flush=True)
+        else:
+            vates_core.encode_tensor(
+                frame_np, filepath, int(mode_id), float(fps), 1, metadata
+            )
+    except Exception:
+        logger.exception("Vates: encode_tensor 失败 path=%s", filepath)
+        raise
 
 
 def _after_pending_drops(prev_pending: int, message: str) -> None:
@@ -377,9 +424,12 @@ def _after_pending_drops(prev_pending: int, message: str) -> None:
     threading.Thread(target=run, daemon=True).start()
 
 
-def _can_append_streaming(filepath: str, arr_bhwc: np.ndarray, fps: float) -> bool:
+def _can_append_streaming(
+    filepath: str, arr_bhwc: np.ndarray, fps: float, output_dir: str
+) -> bool:
     """已与盘上 P2+XXH3 Stream 文件对齐（C/H/W、fps、mode、reserved=2）则可 append。"""
     try:
+        filepath = _require_path_under_comfy_output(filepath, output_dir)
         _batch, ch, hh, ww, mode, reserved, file_fps = vates_core.peek_dct_header(filepath)
     except Exception:
         return False
@@ -394,10 +444,11 @@ def _can_append_streaming(filepath: str, arr_bhwc: np.ndarray, fps: float) -> bo
 
 
 def _streaming_legacy_p2_would_overwrite(
-    filepath: str, arr_bhwc: np.ndarray, fps: float
+    filepath: str, arr_bhwc: np.ndarray, fps: float, output_dir: str
 ) -> bool:
     """旧版 P2（无 XXH3）流式同名文件：若直接 encode 会截断覆盖，需用户先处理。"""
     try:
+        filepath = _require_path_under_comfy_output(filepath, output_dir)
         _batch, ch, hh, ww, mode, reserved, file_fps = vates_core.peek_dct_header(filepath)
     except Exception:
         return False
@@ -464,6 +515,20 @@ class VatesSaveNode:
     OUTPUT_NODE = True
     CATEGORY = "Vates/IO"
 
+    @classmethod
+    def IS_CHANGED(  # noqa: N802 — ComfyUI 协议名
+        cls,
+        images: object,
+        filename_prefix: str,
+        save_mode: str,
+        fps: float,
+        stream_id: str,
+        prompt: object | None = None,
+        extra_pnginfo: object | None = None,
+    ) -> float:
+        """输出节点每次执行均参与刷新，避免默认缓存导致导出行为歧义。"""
+        return float("nan")
+
     def _internal_video_packer(
         self,
         images: torch.Tensor,
@@ -486,17 +551,24 @@ class VatesSaveNode:
         arr = np.ascontiguousarray(x.numpy(), dtype=np.float32)
         if arr.ndim != 4:
             raise ValueError(f"Video Batch 需要 BHWC ndim=4，当前 ndim={arr.ndim}")
+        filepath = _require_path_under_comfy_output(filepath, self.output_dir)
         tag = f"{safe_prefix}_vbatch_{unique}"
         prev = vates_core.get_pending_tasks()
         print(f"Vates: [{tag}] saving in background...", flush=True)
-        vates_core.encode_batch_async(
-            arr,
-            filepath,
-            float(fps),
-            False,
-            SAVE_MODE_TO_ID["Video (Batch)"],
-            workflow_json,
-        )
+        try:
+            vates_core.encode_batch_async(
+                arr,
+                filepath,
+                float(fps),
+                False,
+                SAVE_MODE_TO_ID["Video (Batch)"],
+                workflow_json,
+            )
+        except Exception:
+            logger.exception(
+                "Vates: encode_batch_async（Video Batch）调度失败 path=%s", filepath
+            )
+            raise
         _after_pending_drops(
             prev,
             f"Vates: [{tag}] 后台写入已完成 → {filepath}（{batch} 帧）",
@@ -527,28 +599,37 @@ class VatesSaveNode:
         if arr.ndim != 4:
             raise ValueError(f"Streaming 需要 BHWC ndim=4，当前 ndim={arr.ndim}")
 
+        filepath = _require_path_under_comfy_output(filepath, self.output_dir)
         tag = f"vates_stream__{safe_stream}__{safe_prefix}"
         prev = vates_core.get_pending_tasks()
         print(f"Vates: [{tag}] saving in background...", flush=True)
 
-        if os.path.isfile(filepath) and _streaming_legacy_p2_would_overwrite(filepath, arr, float(fps)):
+        if os.path.isfile(filepath) and _streaming_legacy_p2_would_overwrite(
+            filepath, arr, float(fps), self.output_dir
+        ):
             raise RuntimeError(
                 "\033[91m[Vates]\033[0m 检测到旧版流式 .dct（无 XXH3 块校验，reserved=1）。"
                 "为避免覆盖丢失数据，请先备份或删除/改名该文件，再以 P4 格式重写（reserved=2）。\n"
                 f"文件: {filepath}"
             )
 
-        if os.path.isfile(filepath) and _can_append_streaming(filepath, arr, float(fps)):
-            vates_core.append_to_vats_async(arr, filepath, float(fps))
-        else:
-            vates_core.encode_batch_async(
-                arr,
-                filepath,
-                float(fps),
-                True,
-                SAVE_MODE_TO_ID["Streaming (Append)"],
-                workflow_json,
-            )
+        try:
+            if os.path.isfile(filepath) and _can_append_streaming(
+                filepath, arr, float(fps), self.output_dir
+            ):
+                vates_core.append_to_vats_async(arr, filepath, float(fps))
+            else:
+                vates_core.encode_batch_async(
+                    arr,
+                    filepath,
+                    float(fps),
+                    True,
+                    SAVE_MODE_TO_ID["Streaming (Append)"],
+                    workflow_json,
+                )
+        except Exception:
+            logger.exception("Vates: Streaming 写入调度失败 path=%s", filepath)
+            raise
 
         _after_pending_drops(prev, f"Vates: [{tag}] 后台写入已完成 → {filepath}")
         print(f"[Vates] Streaming 已排队: {filepath}（本批 {batch} 帧）", flush=True)
@@ -569,7 +650,9 @@ class VatesSaveNode:
         for i in range(batch):
             frame_np = _tensor_bhwc_to_chw_numpy(images, i)
             fname = f"{safe_prefix}_{unique}_{i:05d}.dct"
-            filepath = os.path.join(self.output_dir, fname)
+            filepath = _require_path_under_comfy_output(
+                os.path.join(self.output_dir, fname), self.output_dir
+            )
             _encode_dct_frame(
                 frame_np,
                 filepath,
@@ -679,12 +762,7 @@ class VatesLoadNode:
     def load(self, dct_path: str) -> tuple[torch.Tensor, str]:
         _ensure_vates_loaded()
 
-        raw = (dct_path or "").strip()
-        if not raw:
-            raise ValueError("dct_path 不能为空")
-
-        filepath = raw if os.path.isabs(raw) else os.path.join(self.output_dir, raw)
-        filepath = os.path.normpath(filepath)
+        filepath = _resolved_path_under_output(dct_path, self.output_dir)
 
         if not os.path.isfile(filepath):
             raise FileNotFoundError(f"未找到 DCT 文件: {filepath}")
@@ -710,6 +788,7 @@ class VatesLoadNode:
                     f"路径: {filepath}\n"
                     f"详情: {msg}"
                 ) from exc
+            logger.exception("Vates: decode_tensor_with_workflow 失败 path=%s", filepath)
             raise
 
         if not isinstance(arr, np.ndarray):
