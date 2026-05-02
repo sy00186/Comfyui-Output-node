@@ -1,23 +1,231 @@
-# Vates（VATeS）
+# Vates
 
-**版本 / Version:** `0.1.1`（与 `Cargo.toml`、`pyproject.toml` 一致）
+**Version:** `0.1.1` — matches `Cargo.toml` and `pyproject.toml`.
 
 <p align="center">
-  <b>语言切换 Language</b><br>
-  <a href="#lang-zh"><b>简体中文</b></a>
-  &nbsp;·&nbsp;
+  <b>Documentation</b><br>
   <a href="#lang-en"><b>English</b></a>
+  &nbsp;·&nbsp;
+  <a href="#lang-zh"><b>Chinese (Simplified)</b></a>
 </p>
 
-> **使用说明：** 下面分别是「中文」「English」两个可折叠区块。点击标题展开阅读；需切换语言时，折叠当前区块并打开另一区块即可。  
-> **How to use:** Two collapsible sections below. Expand the summary line to read; collapse one and open the other to switch language.
+> **i18n layout:** The **English** guide is listed **first** and opens by default. **Chinese (Simplified)** follows—expand that panel when you need it. Collapse either panel to reduce scrolling.
+
+---
+
+<a id="lang-en"></a>
+
+<details open>
+<summary><b>📗 English — full documentation (shown by default; click to collapse)</b></summary>
+
+## Vates — High-performance `.dct` tensor asset format
+
+Vates stores **8-bit-quantized** tensors under a **fixed 32-byte, big-endian header**, compresses them with **Zstandard**, and optionally **embeds ComfyUI workflow JSON** inside the same `.dct` file. Multi-frame clips use a **trained Zstd dictionary**; current writers also attach a **per-block XXH3-64** checksum for tamper and corruption detection.
+
+### Table of contents
+
+1. [Binary header (32 bytes)](#en-1-binary-header-32-bytes)
+2. [Performance](#en-2-performance)
+3. [Dictionary compression](#en-3-dictionary-compression)
+4. [Integrity (XXH3)](#en-4-integrity-xxh3)
+5. [Workflow embedding and drag-and-drop restore](#en-5-workflow-embedding--drag-restore)
+6. [ComfyUI nodes](#en-6-comfyui-nodes)
+7. [Build and deployment](#en-7-build--deployment)
+8. [Command-line tool (`vates`)](#en-8-cli-vates)
+9. [SDK examples](#en-9-sdk-examples)
+10. [Size versus PNG (illustrative)](#en-10-size-benchmark-illustrative)
+
+---
+
+<h3 id="en-1-binary-header-32-bytes">1. Binary header (32 bytes)</h3>
+
+Every valid `.dct` file begins with a **32-byte big-endian header**. The exact layout is implemented as `DctHeader::to_bytes_be` / `from_bytes_be` in `src/core.rs` (`HEADER_LEN = 32`).
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0–3 | 4 | Magic | Literal ASCII **`VATS`**. |
+| 4–5 | 2 | Version | Unsigned 16-bit **big-endian**. Must be **`1`**; other values are rejected. |
+| 6 | 1 | Mode | Unsigned 8-bit semantic tag used with ComfyUI: **`0`** image sequence, **`1`** video batch, **`2`** streaming append. |
+| 7 | 1 | Reserved | Lower **7 bits** select the **container** layout; bit **`0x80`** means a **`META`** workflow block follows the header. |
+| 8–11 | 4 | Batch (B) | Unsigned 32-bit **big-endian** frame count. |
+| 12–15 | 4 | Channels (C) | Unsigned 32-bit **big-endian** (e.g. **3** for RGB). |
+| 16–19 | 4 | Height (H) | Unsigned 32-bit **big-endian**. |
+| 20–23 | 4 | Width (W) | Unsigned 32-bit **big-endian**. |
+| 24–27 | 4 | FPS | **32-bit floating-point, big-endian** (IEEE-754). |
+| 28–31 | 4 | Padding | **Zero** in the current format (reserved for future use). |
+
+**Container type (lower seven bits of `reserved`).**  
+**`0`:** one contiguous Zstd payload after the header (typical single-frame layout).  
+**`1`:** legacy multi-block container (no per-block digest).  
+**`2`:** multi-block container where each compressed block is followed by a **`u64` big-endian XXH3-64** value; this is what new multi-frame encodes use by default.
+
+**Optional workflow metadata (when bit `0x80` is set).** Immediately after the 32-byte header: the ASCII tag **`META`**, a **big-endian `u32`** giving the length of the following Zstd blob, then **Zstd-compressed UTF-8 JSON** (usually ComfyUI `prompt` / `extra_pnginfo` serialized from Python). If the bit is clear, this block is omitted and the file stays backward-compatible with headers that carry no metadata.
+
+**Payload layout (summary).**  
+After the header and optional `META` block, a **single-frame** file holds one Zstd segment whose decompressed payload is **`min` (f32, LE)**, **`max` (f32, LE)**, then **CHW-ordered `u8`** samples. **Multi-frame** files append a dictionary region, a block count, then per-frame **compressed length + Zstd bytes + (for type `2`) XXH3**.
+
+---
+
+<h3 id="en-2-performance">2. Performance: zero-copy path, parallel quantization, threaded Zstd</h3>
+
+- **Zero-copy from Python.** The `encode_tensor` binding expects a **C-contiguous `float32`** NumPy array in **CHW** order. When the layout is valid, PyO3 hands Rust a read-only view and the encoder wraps it as an `ArrayView1` without copying the pixel buffer first. Call `numpy.ascontiguousarray(..., dtype=numpy.float32)` if the binding reports a layout error.
+
+- **Parallel quantization.** Global min/max and the linear map to **8-bit** codes use **Rayon**, so large frames benefit from multiple CPU cores.
+
+- **Multi-threaded compression.** The crate enables Zstandard’s **`zstdmt`** integration. The helper `zstd_encode_mt` caps worker count at **eight** threads derived from `std::thread::available_parallelism()`, which improves throughput on large uncompressed buffers.
+
+---
+
+<h3 id="en-3-dictionary-compression">3. Dictionary compression (multi-frame)</h3>
+
+When you encode a **BHWC** batch, the implementation samples up to the **first 32 frames**, builds a **shared Zstd dictionary** (bounded by about **64 KiB**), and compresses subsequent frames with that dictionary when it helps. The result is usually **much smaller on disk than an equivalent sequence of PNG files**, and everything lives in **one** `.dct` asset.
+
+---
+
+<h3 id="en-4-integrity-xxh3">4. Integrity (XXH3)</h3>
+
+For container type **`2`**, each compressed frame is stored as **compressed bytes** followed by **`u64` big-endian XXH3-64** of those same bytes. On read or verify, if the hash does not match, the decoder returns **`DctError::DataCorruption`**. In Python you will typically see a **`ValueError`** whose message includes **`VATES_CORRUPTION`**.
+
+---
+
+<h3 id="en-5-workflow-embedding--drag-restore">5. Workflow embedding and drag-and-drop restore</h3>
+
+- **Saving.** `VatesSaveNode` receives ComfyUI’s **`hidden`** inputs **`prompt`** and **`extra_pnginfo`**, serializes them to JSON, and passes that string as **`metadata`** into the Rust encoder, which may write **`META` + Zstd(JSON)** after the header.
+
+- **Loading.** `VatesLoadNode` exposes **`IMAGE`** plus a **`STRING`** output **`workflow_json`** by calling **`decode_tensor_with_workflow`**. If nothing was embedded, that string is empty.
+
+- **Drag-and-drop in the browser.** The script **`web/vates_dct_drop.js`** listens for **`.dct`** files dropped on the page, uploads them to **`POST /vates/extract_workflow`** (multipart field **`file`**), which is registered in **`vates_server_hooks.py`**. The server calls **`read_embedded_workflow_json`**. The front end then tries to restore the graph with **`app.loadGraphData`**, or falls back to API-format import helpers when available.
+
+---
+
+<h3 id="en-6-comfyui-nodes">6. ComfyUI nodes (`vates_nodes.py`)</h3>
+
+**`VatesSaveNode`** (`OUTPUT_NODE = True`)  
+
+- **Required widget inputs:** `images` (**`IMAGE`**, shape **`[B, H, W, C]`**), `filename_prefix`, `save_mode`, `fps`, `stream_id`.  
+- **Hidden inputs (filled in by ComfyUI):** `prompt` bound to **`PROMPT`**, `extra_pnginfo` bound to **`EXTRA_PNGINFO`**.  
+- **`save_mode` values** `Image (Sequence)`, `Video (Batch)`, and `Streaming (Append)` set header **`mode`** to **`0`**, **`1`**, and **`2`** respectively.
+
+**`VatesLoadNode`**  
+
+- **Required:** `dct_path` (**`STRING`**), either absolute or relative to ComfyUI’s **output** folder.  
+- **Outputs:** `RETURN_TYPES` are **`IMAGE`** and **`STRING`**; `RETURN_NAMES` are **`image`** and **`workflow_json`**.
+
+---
+
+<h3 id="en-7-build--deployment">7. Build and deployment</h3>
+
+**Toolchain expectations.** Install **Rust 1.70 or newer**, **Python 3.9 or newer**, and **Cargo**. For the Python module, **maturin** is the supported workflow. ComfyUI itself still needs **PyTorch**, **NumPy**, and ComfyUI’s **`folder_paths`** when you run the bundled nodes.
+
+**Command-line binary only (disables the PyO3 extension feature):**
+
+```bash
+cd dct-core
+cargo build --release --no-default-features
+```
+
+**Python extension (native module `vates_core`):**
+
+```bash
+maturin develop --release
+```
+
+**Linux shared-object naming.** Some distributions emit **`libvates_core.so`**, while your Python loader may expect **`vates_core.so`**. Copy or symlink as needed:
+
+```bash
+cp target/release/libvates_core.so ./vates_core.so
+```
+
+Add either **`custom_nodes/ComfyUI-Vates`** or the whole **`dct-core`** checkout under ComfyUI’s **custom_nodes** directory, then install **`vates_core`** with **`install.py`** or by placing a compatible wheel in **`wheels/`** and running **`pip install`**.
+
+---
+
+<h3 id="en-8-cli-vates">8. Command-line tool (`vates`)</h3>
+
+Run these from the **`dct-core`** tree after a successful build:
+
+```bash
+cargo run --release --no-default-features --bin vates -- inspect path/to/file.dct
+cargo run --release --no-default-features --bin vates -- inspect --json path/to/file.dct
+cargo run --release --no-default-features --bin vates -- verify path/to/file.dct
+```
+
+- **`inspect`** prints a human-readable header summary.  
+- **`inspect --json`** prints embedded workflow JSON to **stdout** when present.  
+- **`verify`** performs full structural and checksum validation.
+
+---
+
+<h3 id="en-9-sdk-examples">9. SDK examples</h3>
+
+**Python**
+
+```python
+import numpy as np
+import vates_core as vc
+
+chw = np.ascontiguousarray(np.random.rand(3, 64, 64).astype(np.float32))
+vc.encode_tensor(chw, "out.dct", mode=0, fps=24.0, batch=1, metadata=None)
+arr, wf = vc.decode_tensor_with_workflow("out.dct")
+
+bhwc = np.ascontiguousarray(np.random.rand(10, 64, 64, 3).astype(np.float32))
+vc.encode_batch(bhwc, "video.dct", fps=24.0, force_p2=False, header_mode=1, metadata=None)
+```
+
+`peek_dct_header(path)` returns **`(batch, channels, height, width, mode, reserved, fps)`**, in the same order as the on-disk header fields.
+
+**Rust** — add the crate without default features if you only need the codec:
+
+```toml
+[dependencies]
+vates_core = { path = "../dct-core", default-features = false }
+```
+
+```rust
+use vates_core::Decoder;
+
+let decoded = Decoder::decode_file_full("file.dct")?;
+let _report = Decoder::verify_file("file.dct")?;
+```
+
+---
+
+<h3 id="en-10-size-benchmark-illustrative">10. Size versus PNG (illustrative only)</h3>
+
+The numbers below are **not** product guarantees. They are **rough order-of-magnitude examples** for **1024×1024 RGB** content across **64** frames, on typical desktop hardware. Always benchmark with **your own** frames and PNG settings.
+
+| Metric | 64-file PNG sequence (example range) | One multi-frame `.dct` (dictionary + XXH3, example range) |
+|--------|--------------------------------------|-----------------------------------------------------------|
+| Total size on disk | About **40–120 MB** (highly content-dependent) | About **8–35 MB** |
+| Uncompressed FP32 reference | — | About **768 MB** |
+| Encode throughput | Often slower (per-file PNG encoding) | Often faster (parallel quantization and threaded Zstd) |
+
+---
+
+### Project layout
+
+```
+dct-core/
+  src/core.rs              # format, encode/decode, dictionary, XXH3
+  src/python_binding.rs
+  src/main.rs               # vates CLI
+  vates_nodes.py            # ComfyUI node definitions
+  vates_server_hooks.py     # POST /vates/extract_workflow
+  web/vates_dct_drop.js     # browser drag-and-drop helper
+  custom_nodes/ComfyUI-Vates/
+  install.py
+  check_vates.py
+```
+
+**License:** MIT OR Apache-2.0
+</details>
 
 ---
 
 <a id="lang-zh"></a>
 
-<details open>
-<summary><b>📘 简体中文文档（点击标题可折叠）</b></summary>
+<details>
+<summary><b>📘 简体中文文档（点击标题展开）</b></summary>
 
 ## Vates — 高性能 `.dct` 张量资产格式
 
@@ -189,187 +397,5 @@ dct-core/
 ```
 
 **许可：** MIT OR Apache-2.0
-
-</details>
-
----
-
-<a id="lang-en"></a>
-
-<details>
-<summary><b>📗 English documentation (click to expand)</b></summary>
-
-## Vates — High-performance `.dct` tensor asset format
-
-**8-bit quantization + Zstandard** for ComfyUI and general pipelines: **32-byte big-endian header**, optional **embedded ComfyUI workflow JSON**, multi-frame **dictionary compression**, and **per-block XXH3** integrity checks.
-
-### Table of contents
-
-1. [Binary header (32 bytes)](#en-1-binary-header-32-bytes)
-2. [Performance](#en-2-performance)
-3. [Dictionary compression](#en-3-dictionary-compression)
-4. [Integrity (XXH3)](#en-4-integrity-xxh3)
-5. [Workflow embedding & drag-restore](#en-5-workflow-embedding--drag-restore)
-6. [ComfyUI nodes](#en-6-comfyui-nodes)
-7. [Build & deployment](#en-7-build--deployment)
-8. [CLI `vates`](#en-8-cli-vates)
-9. [SDK examples](#en-9-sdk-examples)
-10. [Size benchmark (illustrative)](#en-10-size-benchmark-illustrative)
-
----
-
-<h3 id="en-1-binary-header-32-bytes">1. Binary header (32 bytes)</h3>
-
-Every `.dct` file starts with a **32-byte big-endian** header (`DctHeader` in `src/core.rs`, `HEADER_LEN = 32`).
-
-| Offset | Size | Field | Notes |
-|--------|------|-------|-------|
-| 0–3 | 4 | Magic | ASCII **`VATS`** |
-| 4–5 | 2 | Version | `u16` BE, must be **`1`** |
-| 6 | 1 | Mode | `u8`: `0` image sequence / `1` video batch / `2` streaming append |
-| 7 | 1 | Reserved | Low 7 bits = **container**; bit **`0x80`** = **META** workflow block after header |
-| 8–11 | 4 | Batch (B) | `u32` BE |
-| 12–15 | 4 | Channels (C) | `u32` BE |
-| 16–19 | 4 | Height (H) | `u32` BE |
-| 20–23 | 4 | Width (W) | `u32` BE |
-| 24–27 | 4 | FPS | **`f32` big-endian** |
-| 28–31 | 4 | Padding | **zeros** (reserved) |
-
-**Container (low 7 bits):** `0` single zstd segment; `1` multi-block legacy (no per-block hash); `2` multi-block + **`u64` XXH3-64** after each compressed block (default for new multi-frame writes).
-
-**Optional workflow block** when **`reserved & 0x80`:** **`META`** + big-endian **`u32`** (compressed length) + **zstd(UTF-8 JSON)**.
-
-**Payload overview:** After optional META: single zstd → `min f32 LE`, `max f32 LE`, **CHW `u8`**; or multi-frame **dictionary** + per-frame blocks + optional XXH3.
-
----
-
-<h3 id="en-2-performance">2. Performance: zero-copy, parallel quantization, threaded Zstd</h3>
-
-- **Zero-copy:** `encode_tensor` takes **contiguous `float32` CHW** NumPy; PyO3 borrows the buffer and Rust uses `ArrayView1`. Use `numpy.ascontiguousarray(..., dtype=float32)` if needed.
-- **Parallel quantization:** **Rayon** for min/max and 8-bit quantization.
-- **Multi-threaded Zstd:** **`zstdmt`** feature; encoder uses up to **8** worker threads in `zstd_encode_mt`.
-
----
-
-<h3 id="en-3-dictionary-compression">3. Dictionary compression (multi-frame)</h3>
-
-Up to **32** training frames build a shared **Zstd dictionary** (capped around **64 KiB**); frames are compressed with **`EncoderDictionary`** when beneficial—usually much smaller total size than a **PNG sequence**, single file.
-
----
-
-<h3 id="en-4-integrity-xxh3">4. Integrity (XXH3)</h3>
-
-For container **`2`**, each compressed block is followed by **`u64` BE** **XXH3-64** of the **compressed** bytes. Mismatch → **`DctError::DataCorruption`** (often `ValueError` with `VATES_CORRUPTION` in Python).
-
----
-
-<h3 id="en-5-workflow-embedding--drag-restore">5. Workflow embedding & drag-restore</h3>
-
-- **Save:** `VatesSaveNode` reads **`hidden`** `prompt` / `extra_pnginfo`, JSON → **`metadata`** → **`META` + zstd(JSON)**.
-- **Load:** `VatesLoadNode` → **`IMAGE`** + **`workflow_json`** via **`decode_tensor_with_workflow`**.
-- **Drag-drop:** **`web/vates_dct_drop.js`**, **`POST /vates/extract_workflow`** in **`vates_server_hooks.py`**, **`read_embedded_workflow_json`**, **`app.loadGraphData`** (or API import fallbacks).
-
----
-
-<h3 id="en-6-comfyui-nodes">6. ComfyUI nodes (`vates_nodes.py`)</h3>
-
-**`VatesSaveNode`** (`OUTPUT_NODE = True`): required **`images`** (`IMAGE` BHWC), `filename_prefix`, `save_mode`, `fps`, `stream_id`; hidden **`prompt`**, **`extra_pnginfo`**. Modes map to header **`mode`** `0` / `1` / `2`.
-
-**`VatesLoadNode`:** **`dct_path`** (`STRING`); **`RETURN_TYPES`**: `IMAGE`, `STRING`; **`RETURN_NAMES`**: `image`, `workflow_json`.
-
----
-
-<h3 id="en-7-build--deployment">7. Build & deployment</h3>
-
-**Prerequisites:** Rust **1.70+**, Python **3.9+**, **maturin** recommended for the extension; ComfyUI needs **torch**, **numpy**, **folder_paths**.
-
-**CLI / Rust only (no PyO3 module):**
-
-```bash
-cd dct-core
-cargo build --release --no-default-features
-```
-
-**Python extension:**
-
-```bash
-maturin develop --release
-```
-
-**Linux:** if build outputs **`libvates_core.so`** but runtime expects **`vates_core.so`:**
-
-```bash
-cp target/release/libvates_core.so ./vates_core.so
-```
-
-Install **`ComfyUI-Vates`** or the full **`dct-core`** tree as a custom node; use **`install.py`** or wheels under **`wheels/`**.
-
----
-
-<h3 id="en-8-cli-vates">8. CLI `vates`</h3>
-
-```bash
-cargo run --release --no-default-features --bin vates -- inspect path/to/file.dct
-cargo run --release --no-default-features --bin vates -- inspect --json path/to/file.dct
-cargo run --release --no-default-features --bin vates -- verify path/to/file.dct
-```
-
----
-
-<h3 id="en-9-sdk-examples">9. SDK examples</h3>
-
-**Python:**
-
-```python
-import numpy as np
-import vates_core as vc
-
-chw = np.ascontiguousarray(np.random.rand(3, 64, 64).astype(np.float32))
-vc.encode_tensor(chw, "out.dct", mode=0, fps=24.0, batch=1, metadata=None)
-arr, wf = vc.decode_tensor_with_workflow("out.dct")
-
-bhwc = np.ascontiguousarray(np.random.rand(10, 64, 64, 3).astype(np.float32))
-vc.encode_batch(bhwc, "video.dct", fps=24.0, force_p2=False, header_mode=1, metadata=None)
-```
-
-`peek_dct_header(path)` → `(batch, channels, height, width, mode, reserved, fps)`.
-
-**Rust:**
-
-```toml
-[dependencies]
-vates_core = { path = "../dct-core", default-features = false }
-```
-
-```rust
-use vates_core::Decoder;
-let decoded = Decoder::decode_file_full("file.dct")?;
-let _ = Decoder::verify_file("file.dct")?;
-```
-
----
-
-<h3 id="en-10-size-benchmark-illustrative">10. Size vs PNG (illustrative, not a benchmark guarantee)</h3>
-
-**1024×1024**, RGB, **64** frames. Measure on your own hardware.
-
-| Metric | PNG sequence (illustrative) | Single `.dct` (dict + XXH3, illustrative) |
-|--------|-----------------------------|---------------------------------------------|
-| Total size | ~40–120 MB | ~8–35 MB |
-| Raw FP32 | — | ~768 MB |
-| Encode | often slower | parallel quant + zstd MT, often faster |
-
----
-
-### Repository layout
-
-```
-dct-core/
-  src/core.rs, src/python_binding.rs, src/main.rs
-  vates_nodes.py, vates_server_hooks.py, web/vates_dct_drop.js
-  custom_nodes/ComfyUI-Vates/, install.py, check_vates.py
-```
-
-**License:** MIT OR Apache-2.0
 
 </details>
