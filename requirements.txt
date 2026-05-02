@@ -1,0 +1,7 @@
+# ComfyUI 运行环境通常已包含 torch；以下为节点侧最低假设
+numpy>=1.20
+
+# vates_core 为 Rust/PyO3 原生扩展：
+# - 推荐：执行仓库根目录 python install.py
+# - 或：pip install 对应平台的 .whl（见 custom_nodes/ComfyUI-Vates/wheels/）
+# - 开发：cd 仓库根目录 && maturin develop --release

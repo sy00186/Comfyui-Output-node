@@ -1,0 +1,15 @@
+target/
+dist/
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+*.so
+*.pyd
+.DS_Store
