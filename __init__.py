@@ -27,6 +27,19 @@ except RuntimeError as exc:
     raise exc
 
 
+def _print_vates_loaded_banner() -> None:
+    from . import vates_nodes as vn
+
+    vc = vn.vates_core
+    ver = getattr(vc, "__version__", "?")
+    print(
+        f"[Vates] Vates 核心 (vates_core) 加载成功，版本 {ver}（节点期望 {vn.VATES_EXPECTED_CORE_VERSION}）。",
+        flush=True,
+    )
+
+
+_print_vates_loaded_banner()
+
 _PKG = Path(__file__).resolve().parent
 _WEB = _PKG / "web"
 WEB_DIRECTORY = str(_WEB) if (_WEB / "vates_dct_drop.js").is_file() else ""

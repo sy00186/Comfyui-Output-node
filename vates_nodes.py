@@ -26,6 +26,8 @@ import folder_paths
 import numpy as np
 import torch
 
+from vates_repo_meta import expected_vates_core_version
+
 vates_core = None  # type: ignore[assignment, misc]
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,9 @@ SAVE_MODE_TO_ID = {
     "Video (Batch)": 1,
     "Streaming (Append)": 2,
 }
+
+# 与 pyproject.toml / Cargo 发布的 crate 版本一致（对照 vates_core.__version__）
+VATES_EXPECTED_CORE_VERSION: str = expected_vates_core_version()
 
 
 def _vates_repo_root() -> Path:
@@ -195,6 +200,10 @@ def _format_vates_import_error(
     lines.extend(
         [
             "",
+            "  若 `target/release` 下已有 libvates_core.so / libvates_core.dylib / vates_core.dll，",
+            "  但未自动导入成功，请确认已在 **含 Cargo.toml 的仓库根** 运行 `python install.py` 完成对齐；",
+            "  若 ComfyUI 加载的是 **其它目录** 下的 vates_nodes.py，请设置环境变量 VATES_POST_COPY_DIR 为该目录后重装。",
+            "",
             "  解决办法：在 Vates 仓库根目录（含 Cargo.toml 与 install.py）执行一次：",
             "    python install.py",
             "  然后重启 ComfyUI。",
@@ -202,6 +211,17 @@ def _format_vates_import_error(
         ]
     )
     return "\n".join(lines)
+
+
+def _verify_vates_core_version(vc: object) -> None:
+    """原生扩展与节点代码版本须一致，避免 ABI/协议漂移导致崩溃。"""
+    got = getattr(vc, "__version__", None)
+    if got != VATES_EXPECTED_CORE_VERSION:
+        raise RuntimeError(
+            "vates_core 与当前节点代码版本不匹配："
+            f"扩展报告 __version__={got!r}，节点期望 {VATES_EXPECTED_CORE_VERSION!r}。"
+            "请在本仓库根目录重新执行 `python install.py` 或安装对应版本的 wheel，然后重启 ComfyUI。"
+        )
 
 
 def _ensure_vates_loaded() -> None:
@@ -243,6 +263,7 @@ def _ensure_vates_loaded() -> None:
     except Exception as e:
         raise RuntimeError(_format_vates_import_error(e, root=root, tried_paths=tried_paths)) from e
 
+    _verify_vates_core_version(vates_core)
     _register_atexit_flush_once()
 
 

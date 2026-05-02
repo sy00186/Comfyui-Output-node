@@ -12,6 +12,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 RELEASE = ROOT / "target" / "release"
 
+from vates_repo_meta import expected_vates_core_version
+
+
+def _extension_version_matches(mod: object) -> bool:
+    return getattr(mod, "__version__", None) == expected_vates_core_version()
+
 
 def _pick_windows_native_artifact(release_dir: Path) -> Path | None:
     """
@@ -85,7 +91,8 @@ def load_vates_core_via_windows_dll() -> bool:
             sys.path.insert(0, str(ROOT))
         mod_ref = importlib.import_module("vates_core")
         ok = (
-            hasattr(mod_ref, "encode_tensor")
+            _extension_version_matches(mod_ref)
+            and hasattr(mod_ref, "encode_tensor")
             and hasattr(mod_ref, "encode_batch")
             and hasattr(mod_ref, "encode_batch_async")
             and hasattr(mod_ref, "get_pending_tasks")
@@ -114,7 +121,8 @@ def load_vates_core_posix() -> bool:
             sys.path.insert(0, str(ROOT))
         mod = importlib.import_module("vates_core")
         return (
-            hasattr(mod, "encode_tensor")
+            _extension_version_matches(mod)
+            and hasattr(mod, "encode_tensor")
             and hasattr(mod, "encode_batch")
             and hasattr(mod, "decode_tensor_with_workflow")
         )
@@ -148,6 +156,8 @@ def main() -> int:
     if not core_ok:
         print("FAIL")
         print(f"  cwd={os.getcwd()}", file=sys.stderr)
+        exp = expected_vates_core_version()
+        print(f"  期望 vates_core.__version__ == {exp!r}（与 pyproject 一致）。若不匹配请重新 python install.py。", file=sys.stderr)
         print(f"  expected: {ROOT / 'vates_core.so'} or {RELEASE / 'libvates_core.so'} (Linux)", file=sys.stderr)
         print(f"            or {RELEASE / 'libvates_core.dylib'} (macOS)", file=sys.stderr)
         print(f"            {ROOT / 'vates_core.pyd'} or {RELEASE / 'vates_core*.pyd'} (Windows)", file=sys.stderr)
