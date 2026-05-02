@@ -10,7 +10,7 @@ Vates 安装入口：确保当前 Python 环境可 `import vates_core`。
 
 说明：
 - 本脚本**不发起任何网络请求**（除非 pip/maturin 自身配置镜像源）；
-- 适合 RunningHub 工单场景：客服放置 wheel 后执行一次 `python install.py`。
+- 适合 ComfyUI：将匹配当前 Python 的 `vates_core-*.whl` 放入 `wheels/` 后，在仓库根执行一次 `python install.py` 即可装入当前环境。
 """
 
 from __future__ import annotations
