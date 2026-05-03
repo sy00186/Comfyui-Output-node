@@ -533,7 +533,8 @@ class VatesSaveNode:
             },
         }
 
-    RETURN_TYPES: tuple = ()
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
     FUNCTION = "save"
     OUTPUT_NODE = True
     CATEGORY = "Vates/IO"
@@ -749,7 +750,10 @@ class VatesSaveNode:
             if len(saved_paths) == 1
             else f"{len(saved_paths)} 个文件（首帧）：{saved_paths[0]}"
         )
-        return {"ui": {"text": (preview,)}}
+        return {
+            "ui": {"text": (preview,)},
+            "result": (images,),
+        }
 
 
 class VatesLoadAndPreview:
@@ -857,7 +861,10 @@ class VatesLoadAndPreview:
 
         prefix = f"vates_preview_{secrets.token_hex(8)}"
         fname = f"{prefix}.png"
-        dest = os.path.join(self.temp_dir, fname)
+        temp_base = os.path.abspath(self.temp_dir)
+        if not os.path.exists(temp_base):
+            os.makedirs(temp_base, exist_ok=True)
+        dest = os.path.abspath(os.path.join(temp_base, fname))
         pil_img.save(dest, format="PNG", compress_level=1)
 
         print(
