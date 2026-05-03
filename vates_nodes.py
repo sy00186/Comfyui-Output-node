@@ -25,7 +25,6 @@ from pathlib import Path
 import folder_paths
 import numpy as np
 import torch
-from PIL import Image
 
 from .vates_repo_meta import expected_vates_core_version
 
@@ -846,18 +845,26 @@ class VatesLoadAndPreview:
             )
 
         # 明线预览：仅首帧，0..1 → 0..255 uint8，供 PIL；不改动 image_bhwc（下游全精度）。
+        try:
+            from PIL import Image as PilImage
+        except ImportError as exc:
+            raise RuntimeError(
+                "Vates · Load & Preview 需要 Pillow（`pip install pillow`），"
+                "或改用「Vates · Load (.dct)」节点（不依赖 PIL）。"
+            ) from exc
+
         frame = image_bhwc[0].detach().cpu().numpy().astype(np.float32, copy=False)
         clipped = np.clip(frame, 0.0, 1.0)
         rgb_u8 = np.clip(np.round(clipped * 255.0), 0.0, 255.0).astype(np.uint8)
         c = rgb_u8.shape[2]
         if c == 1:
-            pil_img = Image.fromarray(rgb_u8[:, :, 0], mode="L")
+            pil_img = PilImage.fromarray(rgb_u8[:, :, 0], mode="L")
         elif c == 3:
-            pil_img = Image.fromarray(rgb_u8, mode="RGB")
+            pil_img = PilImage.fromarray(rgb_u8, mode="RGB")
         elif c == 4:
-            pil_img = Image.fromarray(rgb_u8, mode="RGBA")
+            pil_img = PilImage.fromarray(rgb_u8, mode="RGBA")
         else:
-            pil_img = Image.fromarray(rgb_u8[:, :, :3], mode="RGB")
+            pil_img = PilImage.fromarray(rgb_u8[:, :, :3], mode="RGB")
 
         prefix = f"vates_preview_{secrets.token_hex(8)}"
         fname = f"{prefix}.png"
