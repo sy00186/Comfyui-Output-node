@@ -35,6 +35,7 @@ def _ensure_vates_nodes_importable() -> None:
 _ensure_vates_nodes_importable()
 import vates_nodes  # noqa: E402
 from vates_nodes import (  # noqa: E402
+    VatesLoadAndPreview,
     VatesLoadNode,
     VatesSaveNode,
     _ensure_vates_loaded,
@@ -77,11 +78,13 @@ def _vates_web_dir() -> str:
 NODE_CLASS_MAPPINGS = {
     "VatesSaveNode": VatesSaveNode,
     "VatesLoadNode": VatesLoadNode,
+    "VatesLoadAndPreview": VatesLoadAndPreview,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VatesSaveNode": "Vates · Save (.dct)",
     "VatesLoadNode": "Vates · Load (.dct)",
+    "VatesLoadAndPreview": "Vates · Load & Preview",
 }
 
 WEB_DIRECTORY = _vates_web_dir()

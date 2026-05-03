@@ -25,6 +25,7 @@ from pathlib import Path
 import folder_paths
 import numpy as np
 import torch
+from PIL import Image
 
 from .vates_repo_meta import expected_vates_core_version
 
@@ -321,6 +322,28 @@ def _resolved_path_under_output(raw: str, output_dir: str) -> str:
             f"[Vates] dct_path 已解析为 {cand!r}，不在 ComfyUI output 目录 {out_abs!r} 内。"
         )
     return cand
+
+
+def _list_dct_rel_paths_under_output(output_dir: str) -> list[str]:
+    """递归列出 ``output`` 下所有 ``.dct``，返回相对 ``output_dir`` 的路径（POSIX 斜杠）。"""
+    out = (output_dir or "").strip()
+    if not out or not os.path.isdir(out):
+        return []
+    out_abs = os.path.realpath(out)
+    found: list[str] = []
+    for root, _dirs, files in os.walk(out_abs):
+        for f in files:
+            if not f.lower().endswith(".dct"):
+                continue
+            full = os.path.join(root, f)
+            try:
+                rel = os.path.relpath(full, out_abs)
+            except ValueError:
+                continue
+            if rel.startswith(".." + os.sep) or rel == "..":
+                continue
+            found.append(rel.replace("\\", "/"))
+    return sorted(found)
 
 
 def _require_path_under_comfy_output(filepath: str, output_dir: str) -> str:
@@ -729,6 +752,132 @@ class VatesSaveNode:
         return {"ui": {"text": (preview,)}}
 
 
+class VatesLoadAndPreview:
+    """自 ComfyUI ``output`` 目录选择 ``.dct``：全精度 ``IMAGE`` 供下游，并写临时 PNG 做 UI 预览（首帧）。"""
+
+    def __init__(self) -> None:
+        self.output_dir = folder_paths.get_output_directory()
+        self.temp_dir = folder_paths.get_temp_directory()
+        self._type = "temp"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict:  # noqa: N802
+        out = folder_paths.get_output_directory()
+        names = _list_dct_rel_paths_under_output(out)
+        choices = names if names else ["(output 目录下暂无 .dct 文件)"]
+        default = names[0] if names else choices[0]
+        return {
+            "required": {
+                "dct_file": (
+                    tuple(choices),
+                    {
+                        "default": default,
+                        "tooltip": "扫描自 folder_paths.get_output_directory()，选中的为相对 output 的路径",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "load_and_preview"
+    OUTPUT_NODE = True
+    CATEGORY = "Vates/IO"
+
+    @classmethod
+    def IS_CHANGED(  # noqa: N802
+        cls,
+        dct_file: str,
+    ) -> float:
+        return float("nan")
+
+    def load_and_preview(self, dct_file: str) -> dict:
+        _ensure_vates_loaded()
+
+        if not dct_file or dct_file.startswith("("):
+            raise FileNotFoundError("请先在 output 目录保存或放入至少一个 .dct，再于下拉列表中选择。")
+
+        filepath = _resolved_path_under_output(dct_file, self.output_dir)
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(f"未找到 DCT 文件: {filepath}")
+
+        try:
+            arr, _wf_opt = vates_core.decode_tensor_with_workflow(filepath)
+        except FileNotFoundError:
+            raise
+        except Exception as exc:
+            msg = str(exc)
+            low = msg.lower()
+            if "vates_corruption" in low or "data corruption" in low or "xxh3" in low:
+                logger.error("Vates 数据损坏（校验失败）: %s — %s", filepath, msg)
+                raise RuntimeError(
+                    "\033[91m[Vates 数据损坏 / XXH3 校验失败]\033[0m\n"
+                    f"路径: {filepath}\n"
+                    f"详情: {msg}"
+                ) from exc
+            if "invalid magic" in low or "bad magic" in low:
+                logger.error("Vates 文件头无效（可能非 .dct）: %s", filepath)
+                raise RuntimeError(
+                    "\033[91m[Vates 文件格式错误]\033[0m 非有效 VATS .dct 或文件已截断。\n"
+                    f"路径: {filepath}\n"
+                    f"详情: {msg}"
+                ) from exc
+            logger.exception("Vates: decode_tensor_with_workflow 失败 path=%s", filepath)
+            raise
+
+        if not isinstance(arr, np.ndarray):
+            arr = np.asarray(arr, dtype=np.float32)
+        if arr.dtype != np.float32:
+            arr = arr.astype(np.float32, copy=False)
+
+        if arr.ndim == 3:
+            tensor_chw = torch.from_numpy(np.ascontiguousarray(arr))
+            tensor_hwc = tensor_chw.permute(1, 2, 0).contiguous()
+            image_bhwc = tensor_hwc.unsqueeze(0)
+        elif arr.ndim == 4:
+            image_bhwc = torch.from_numpy(np.ascontiguousarray(arr)).permute(0, 2, 3, 1).contiguous()
+        else:
+            raise ValueError(
+                f"解码数组应为 CHW（ndim=3）或 BCHW（ndim=4），当前 ndim={arr.ndim}"
+            )
+
+        # 明线预览：仅首帧，0..1 → 0..255 uint8，供 PIL；不改动 image_bhwc（下游全精度）。
+        frame = image_bhwc[0].detach().cpu().numpy().astype(np.float32, copy=False)
+        clipped = np.clip(frame, 0.0, 1.0)
+        rgb_u8 = np.clip(np.round(clipped * 255.0), 0.0, 255.0).astype(np.uint8)
+        c = rgb_u8.shape[2]
+        if c == 1:
+            pil_img = Image.fromarray(rgb_u8[:, :, 0], mode="L")
+        elif c == 3:
+            pil_img = Image.fromarray(rgb_u8, mode="RGB")
+        elif c == 4:
+            pil_img = Image.fromarray(rgb_u8, mode="RGBA")
+        else:
+            pil_img = Image.fromarray(rgb_u8[:, :, :3], mode="RGB")
+
+        prefix = f"vates_preview_{secrets.token_hex(8)}"
+        fname = f"{prefix}.png"
+        dest = os.path.join(self.temp_dir, fname)
+        pil_img.save(dest, format="PNG", compress_level=1)
+
+        print(
+            f"[Vates] Load & Preview: {filepath}，形状 {tuple(image_bhwc.shape)} → 预览 {fname}",
+            flush=True,
+        )
+        return {
+            "result": (image_bhwc,),
+            "ui": {
+                "images": [
+                    {
+                        "filename": fname,
+                        "subfolder": "",
+                        "type": self._type,
+                    }
+                ]
+            },
+        }
+
+
 class VatesLoadNode:
     """从 `.dct` 恢复为 ComfyUI IMAGE：单帧为 [1,H,W,C]；P2 多帧为 [B,H,W,C]。
 
@@ -812,4 +961,4 @@ class VatesLoadNode:
         return (image_bhwc, wf_out)
 
 
-__all__ = ["VatesLoadNode", "VatesSaveNode"]
+__all__ = ["VatesLoadAndPreview", "VatesLoadNode", "VatesSaveNode"]

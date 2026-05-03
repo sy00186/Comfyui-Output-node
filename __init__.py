@@ -9,7 +9,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from .vates_nodes import VatesLoadNode, VatesSaveNode, _ensure_vates_loaded
+from .vates_nodes import (
+    VatesLoadAndPreview,
+    VatesLoadNode,
+    VatesSaveNode,
+    _ensure_vates_loaded,
+)
 from .vates_server_hooks import register_vates_server_routes
 
 try:
@@ -47,11 +52,13 @@ WEB_DIRECTORY = str(_WEB) if (_WEB / "vates_dct_drop.js").is_file() else ""
 NODE_CLASS_MAPPINGS = {
     "VatesSaveNode": VatesSaveNode,
     "VatesLoadNode": VatesLoadNode,
+    "VatesLoadAndPreview": VatesLoadAndPreview,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VatesSaveNode": "Vates · Save (.dct)",
     "VatesLoadNode": "Vates · Load (.dct)",
+    "VatesLoadAndPreview": "Vates · Load & Preview",
 }
 
 register_vates_server_routes()
